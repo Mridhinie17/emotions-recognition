@@ -6,3 +6,5 @@ __pycache__/
 *.pyc
 .env
 outputs/
+saved_models/
+*.h5

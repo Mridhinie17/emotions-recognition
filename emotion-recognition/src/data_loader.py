@@ -9,8 +9,11 @@ def build_augmentation_layer(img_size=(96,96)):
     return tf.keras.Sequential([
         tf.keras.layers.Resizing(img_size[0], img_size[1]),
         tf.keras.layers.RandomFlip("horizontal"),
-        tf.keras.layers.RandomRotation(0.08),
-        tf.keras.layers.RandomTranslation(0.06, 0.06),
+        tf.keras.layers.RandomRotation(0.12),
+        tf.keras.layers.RandomTranslation(0.08, 0.08),
+        tf.keras.layers.RandomContrast(0.15),
+        tf.keras.layers.RandomBrightness(0.15),
+        tf.keras.layers.RandomZoom(0.1),
     ])
 
 def to_rgb(images):
@@ -70,8 +73,7 @@ def load_fer2013_from_folders(base_dir='data', img_size=(96,96), batch_size=64, 
             x = rescale(x)
             return x, y
         ds = ds.map(_map, num_parallel_calls=AUTOTUNE)
-        ds = ds.cache()
-        ds = ds.shuffle(2000)
+        ds = ds.shuffle(500)
         ds = ds.prefetch(AUTOTUNE)
         return ds
 
@@ -82,7 +84,6 @@ def load_fer2013_from_folders(base_dir='data', img_size=(96,96), batch_size=64, 
             x = rescale(x)
             return x, y
         ds = ds.map(_map, num_parallel_calls=AUTOTUNE)
-        ds = ds.cache()
         ds = ds.prefetch(AUTOTUNE)
         return ds
 
