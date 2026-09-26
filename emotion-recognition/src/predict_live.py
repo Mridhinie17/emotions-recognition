@@ -9,21 +9,23 @@ from pathlib import Path
 
 # ================== CONFIG ==================
 PREFERRED_MODELS = [
-    "saved_models/best_model_finetuned.h5",  # MobileNetV2 (96x96x3)
-    "saved_models/best_model_transfer.h5",
-    "saved_models/final_model.h5"            # old CNN (48x48x1)
+    "saved_models/best_model_finetuned.h5",   # MobileNetV2 (96x96x3)
+    "saved_models/best_model_efficientv2.h5", # EfficientNetV2
+    "saved_models/best_model_resnet.h5",      # ResNet50V2
+    "saved_models/best_model.h5",             # Custom CNN
+    "saved_models/final_model.h5"             # Final CNN
 ]
 FACE_PROTO   = "models/deploy.prototxt"
 FACE_WEIGHTS = "models/res10_300x300_ssd_iter_140000.caffemodel"
 
 # Detection / cropping
 FACE_CONF_THRESH = 0.6
-FACE_MARGIN = 0.25         # 25% padding around face box
-MIN_FACE = 120             # min face size in px (shorter side) to accept
+FACE_MARGIN = 0.05         # 5% tight padding (FER-2013 training set is tightly cropped)
+MIN_FACE = 100             # min face size in px (shorter side) to accept
 
 # Camera
-FRONT_CAM_INDEX = 1
-BACK_CAM_INDEX  = 0
+FRONT_CAM_INDEX = 0
+BACK_CAM_INDEX  = 1
 FRAME_W, FRAME_H = 640, 480
 
 # Smoothing & output
@@ -59,16 +61,20 @@ def preprocess_face(face_bgr, target_hw, channels):
     upscale = (fh < H) or (fw < W)
     interp = cv2.INTER_CUBIC if upscale else cv2.INTER_AREA
 
+    # Convert to grayscale first to match training pipeline (FER2013 grayscale dataset)
+    gray = cv2.cvtColor(face_bgr, cv2.COLOR_BGR2GRAY)
+    if APPLY_HISTEQ_FOR_GRAY:
+        gray = cv2.equalizeHist(gray)
+    
+    resized_gray = cv2.resize(gray, (W, H), interpolation=interp)
+    x_gray = resized_gray.astype("float32") / 255.0
+
     if channels == 1:
-        gray = cv2.cvtColor(face_bgr, cv2.COLOR_BGR2GRAY)
-        if APPLY_HISTEQ_FOR_GRAY:
-            gray = cv2.equalizeHist(gray)
-        resized = cv2.resize(gray, (W, H), interpolation=interp)
-        x = resized.astype("float32") / 255.0
-        x = x[..., None]  # (H,W,1)
+        x = x_gray[..., None]  # (H,W,1)
     else:
-        resized = cv2.resize(face_bgr, (W, H), interpolation=interp)
-        x = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB).astype("float32") / 255.0
+        # Repeat single channel 3 times to match tf.image.grayscale_to_rgb used in training
+        x = np.repeat(x_gray[..., None], 3, axis=-1)  # (H,W,3)
+
     return np.expand_dims(x, axis=0)  # (1,H,W,C)
 
 def load_face_detector():
@@ -81,7 +87,10 @@ def load_face_detector():
         return None
 
 def open_camera(idx):
-    cap = cv2.VideoCapture(idx)
+    # Try DirectShow first on Windows for faster initialization, fall back to default
+    cap = cv2.VideoCapture(idx, cv2.CAP_DSHOW)
+    if not cap.isOpened():
+        cap = cv2.VideoCapture(idx)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH,  FRAME_W)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_H)
     cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))  # helps on some webcams
@@ -101,17 +110,25 @@ def expand_with_margin(x1, y1, x2, y2, margin, w, h):
     return x1m, y1m, x2m, y2m
 
 def main():
-    # --- Load model ---
-    model_path = pick_model()
-    if not model_path:
-        print("❌ No model found in saved_models/. Place a .h5 file there.")
+    # --- Load all available models ---
+    available_models = []
+    for p in PREFERRED_MODELS:
+        if os.path.exists(p):
+            try:
+                m = tf.keras.models.load_model(p, compile=False)
+                h, w, c = infer_input_specs(m)
+                name = os.path.basename(p)
+                available_models.append({'name': name, 'model': m, 'hw': (h, w), 'c': c, 'path': p})
+                print(f"✅ Loaded model: {name} ({h}x{w}x{c})")
+            except Exception as ex:
+                print(f"⚠️ Could not load {p}: {ex}")
+
+    if not available_models:
+        print("❌ No valid models found in saved_models/. Place .h5 files there.")
         return
-    print(f"✅ Loading model: {model_path}")
-    model = tf.keras.models.load_model(model_path)
-    H, W, C = infer_input_specs(model)
-    print(f"ℹ️  Model expects: {H}x{W}x{C} (HxWxC)")
-    if len(CLASS_NAMES) != model.output_shape[-1]:
-        print(f"⚠️ CLASS_NAMES length {len(CLASS_NAMES)} != model outputs {model.output_shape[-1]}. Check order!")
+
+    current_model_idx = 0
+    use_ensemble = True if len(available_models) > 1 else False
 
     # --- Load detector ---
     face_net = load_face_detector()
@@ -126,7 +143,7 @@ def main():
     if cap is None:
         print("❌ Could not open any camera. Check device permissions.")
         return
-    print(f"🎥 Using camera index {cam_idx}. Press 'q' to quit, '0' to switch.")
+    print(f"🎥 Using camera index {cam_idx}. Press 'q' to quit, 'm' to switch model, 'e' to toggle ensemble, '0' to switch camera.")
 
     ema = None
     pred_buffer = deque(maxlen=ROLLING_WINDOW)
@@ -175,8 +192,17 @@ def main():
                     cv2.rectangle(frame, (x1m, y1m), (x2m, y2m), (0,255,0), 2)
 
                     try:
-                        x_in = preprocess_face(face, (H, W), C)
-                        preds = model.predict(x_in, verbose=0)[0]
+                        if use_ensemble:
+                            all_preds = []
+                            for m_info in available_models:
+                                x_in = preprocess_face(face, m_info['hw'], m_info['c'])
+                                p = m_info['model'].predict(x_in, verbose=0)[0]
+                                all_preds.append(p)
+                            preds = np.mean(all_preds, axis=0)
+                        else:
+                            m_info = available_models[current_model_idx]
+                            x_in = preprocess_face(face, m_info['hw'], m_info['c'])
+                            preds = m_info['model'].predict(x_in, verbose=0)[0]
 
                         if USE_EMA:
                             if ema is None:
@@ -209,6 +235,11 @@ def main():
                         draw_text(frame, "Prediction error (see console)", 28, (0,0,255))
                         print("❌ Prediction error:", repr(e))
 
+            # Display active model at bottom left
+            mode_str = "ENSEMBLE (All Models)" if use_ensemble else f"MODEL: {available_models[current_model_idx]['name']}"
+            cv2.putText(frame, f"[{mode_str}] ('m':switch 'e':ensemble)", (10, FRAME_H - 15),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 0), 1, cv2.LINE_AA)
+
             # FPS
             if SHOW_FPS:
                 now = time.time()
@@ -224,6 +255,15 @@ def main():
             key = cv2.waitKey(1) & 0xFF
             if key == ord('q'):
                 break
+            elif key == ord('m'):
+                use_ensemble = False
+                current_model_idx = (current_model_idx + 1) % len(available_models)
+                ema = None; pred_buffer.clear()
+                print(f"🔄 Switched to Model: {available_models[current_model_idx]['name']}")
+            elif key == ord('e'):
+                use_ensemble = not use_ensemble
+                ema = None; pred_buffer.clear()
+                print(f"🔀 Ensemble mode: {'ENABLED' if use_ensemble else 'DISABLED'}")
             elif key == ord('0'):
                 # switch cameras
                 cap.release()
